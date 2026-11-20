@@ -1,0 +1,11 @@
+2026-11-20 14:13:11.193 UTC [2651] LOG:  starting PostgreSQL 15.20 (Debian 15.20-0+deb12u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+2026-11-20 14:13:11.193 UTC [2651] LOG:  listening on IPv4 address "127.0.0.1", port 55434
+2026-11-20 14:13:11.194 UTC [2651] LOG:  listening on Unix socket "/workspace/inspection-handover/.localrun/.s.PGSQL.55434"
+2026-11-20 14:13:11.196 UTC [2654] LOG:  database system was shut down at 2026-11-20 14:13:10 UTC
+2026-11-20 14:13:11.199 UTC [2651] LOG:  database system is ready to accept connections
+2026-11-20 14:13:11.529 UTC [2678] LOG:  logical replication apply worker for subscription "inspection_sub" has started
+2026-11-20 14:13:11.536 UTC [2684] LOG:  logical replication table synchronization worker for subscription "inspection_sub", table "work_orders" has started
+2026-11-20 14:13:11.545 UTC [2684] LOG:  logical replication table synchronization worker for subscription "inspection_sub", table "work_orders" has finished
+2026-11-20 14:13:13.456 UTC [2678] LOG:  logical replication apply worker for subscription "inspection_sub" will stop because the subscription was disabled
+2026-11-20 14:13:13.456 UTC [2678] CONTEXT:  processing remote data for replication origin "pg_16396" during message type "INSERT" in transaction 732, finished at 0/194A8A0
+2026-11-20 14:13:21.325 UTC [2750] LOG:  logical replication apply worker for subscription "inspection_sub" has started

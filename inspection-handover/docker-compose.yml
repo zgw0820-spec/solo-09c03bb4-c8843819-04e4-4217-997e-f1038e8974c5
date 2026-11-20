@@ -1,0 +1,78 @@
+# 巡检工单库交接演示：FastAPI + 旧库(发布端) + 新库(订阅端)，已配置逻辑复制
+services:
+  # 旧库：逻辑复制发布端，初始为接单库
+  old-db:
+    image: postgres:15
+    container_name: ih-old-db
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: inspection
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    ports:
+      - "5433:5432"
+    volumes:
+      - old-pgdata:/var/lib/postgresql/data
+      - ./db/old/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d inspection"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # 新库：逻辑复制订阅端，交接完成后接单
+  new-db:
+    image: postgres:15
+    container_name: ih-new-db
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: inspection
+      # 订阅端通过这个 DSN 连接发布端（同一 compose 网络内的主机名 old-db）
+      PUBLISHER_DSN: host=old-db port=5432 user=appuser password=apppass dbname=inspection
+    ports:
+      - "5434:5432"
+    volumes:
+      - new-pgdata:/var/lib/postgresql/data
+      - ./db/new/init:/docker-entrypoint-initdb.d:ro
+    depends_on:
+      old-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d inspection"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: ih-app
+    environment:
+      OLD_DSN: host=old-db port=5432 user=appuser password=apppass dbname=inspection
+      NEW_DSN: host=new-db port=5432 user=appuser password=apppass dbname=inspection
+      STATE_DB_PATH: /data/handover_state.db
+      CUTOVER_TIMEOUT_SECONDS: "30"
+      SUBSCRIPTION_NAME: inspection_sub
+    ports:
+      - "8000:8000"
+    volumes:
+      - app-data:/data
+    depends_on:
+      old-db:
+        condition: service_healthy
+      new-db:
+        condition: service_healthy
+
+volumes:
+  old-pgdata:
+  new-pgdata:
+  app-data:

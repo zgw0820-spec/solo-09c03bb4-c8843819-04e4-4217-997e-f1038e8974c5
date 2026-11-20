@@ -1,0 +1,3 @@
+.localrun/
+**/__pycache__/
+*.pyc
