@@ -56,22 +56,25 @@ def work_orders() -> dict:
 
 @app.post("/api/work-orders")
 def submit_work_order(payload: WorkOrderIn) -> dict:
-    state = manager.current_state()
-    if state == "SWITCHING":
+    # 接单许可与状态切换互斥：暂停前获准的请求会被交接等到提交/回滚；
+    # 暂停期间到达的请求直接 503；生效后获准的请求只写新库。
+    admitted_state = manager.begin_write()
+    if admitted_state is None:
         raise HTTPException(status_code=503, detail="交接进行中，旧库已暂停接单，请稍后再试")
-    if state == "NEW":
+    if admitted_state == "NEW":
         target_dsn, target_name = settings.new_dsn, "new"
     else:
         target_dsn, target_name = settings.old_dsn, "old"
 
-    manager.enter_write()
     try:
         row = db.insert_work_order(target_dsn, payload.title, payload.detail, target_name)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"写入失败: {exc}") from exc
     finally:
+        # insert_work_order 返回/抛错时连接已关闭（提交或回滚均已落定），
+        # 此刻才放行在途计数，交接才会继续确认追平
         manager.exit_write()
-    return {"work_order": row, "accepted_by": target_name, "state": state}
+    return {"work_order": row, "accepted_by": target_name, "state": admitted_state}
 
 
 @app.post("/api/cutover")
@@ -237,8 +240,9 @@ async function startCutover(){
   const d = await r.json();
   const el = document.getElementById('msg');
   if(r.ok && d.ok){
-    show(el, d.already_done ? '交接早已生效，当前接单库：新库（重复点击不重复切换）'
-      : '交接成功！首个新编号：' + d.first_new_id + '，旧库最高预留号：' + d.old_highest_reserved, '#047857');
+    // 成功/已生效/重叠请求统一由服务端 message 说明；重叠请求不会重复切换
+    const extra = d.first_new_id ? '（首个新编号：' + d.first_new_id + '，旧库最高预留号：' + d.old_highest_reserved + '）' : '';
+    show(el, d.message + extra, d.accepting_db === 'new' ? '#047857' : '#b45309');
   } else {
     show(el, '交接失败已回滚，旧库恢复接单：' + d.error, '#b91c1c');
   }

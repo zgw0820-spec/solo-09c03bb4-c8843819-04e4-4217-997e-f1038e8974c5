@@ -11,7 +11,8 @@ FastAPI + 双 PostgreSQL 15（逻辑复制）实现的工单库单向交接：�
 ├── app/                          # FastAPI 应用（含 Dockerfile、requirements）
 │   └── app/
 │       ├── main.py               # 路由与演示网页（工单、交接、订阅暂停/恢复、日志）
-│       ├── cutover.py            # 交接状态机：OLD -> SWITCHING -> NEW，失败/超时回滚
+│       ├── cutover.py            # 交接状态机：OLD -> SWITCHING -> NEW，失败/超时回滚；
+│       │                         #   接单许可互斥 + 交接串行化（重叠请求只回报当前接单库）
 │       ├── state.py              # 接单库状态持久化（SQLite，重启沿用）
 │       ├── db.py                 # PG 访问：工单写入、序列快照、复制状态查询
 │       └── config.py             # 环境变量配置
@@ -20,7 +21,7 @@ FastAPI + 双 PostgreSQL 15（逻辑复制）实现的工单库单向交接：�
 ├── scripts/
 │   ├── local_pg.sh               # 无 Docker 时用本地 PG 二进制起两库并配置复制
 │   └── local_app.sh              # 无 Docker 时本地启动应用
-└── tests/e2e_test.py             # 端到端试跑（27 项断言）
+└── tests/e2e_test.py             # 端到端试跑（60 项断言，含重叠交接与并发压测）
 ```
 
 ## 方式一：Docker Compose（交付目标）
@@ -51,10 +52,16 @@ python -I tests/e2e_test.py      # 端到端试跑
 1. **统一入口**：网页 `POST /api/work-orders` 按当前接单库路由，响应返回工单
    编号与 `accepted_by`（old/new）。
 2. **单向交接**：`POST /api/cutover`（需 `confirm=true`）。状态机
-   `OLD -> SWITCHING -> NEW`，交接串行，进行中再次发起返回冲突提示。
-3. **旧库暂停接单**：进入 SWITCHING 后网页提交返回 503。
-4. **等在途写入结束**：进程内在途计数 + 旧库 `pg_stat_activity` 中
-   `xact_start/backend_xid` 非空的客户端事务双重确认（覆盖 idle in transaction）。
+   `OLD -> SWITCHING -> NEW`，同一时刻只有一个交接在执行（`switch_lock`，
+   拿锁后双重检查状态）。交接进行中到达的重叠请求不报错也不重复执行：
+   等前者落定后只返回当前接单库（含生效前到达、仍待处理的请求）；
+   已在 NEW 时重复点击同样只返回当前接单库。
+3. **旧库暂停接单**：进入 SWITCHING 后网页提交立即返回 503。
+4. **等在途写入结束**：接单许可（`begin_write`）把“读状态 + 在途计数”放在
+   `admit_lock` 临界区内，交接切 SWITCHING 也走同一把锁——暂停前已获准写
+   旧库的请求一定先被计数，交接等它提交/回滚后才确认追平并对齐序列；
+   另有旧库 `pg_stat_activity` 中 `xact_start/backend_xid` 非空的客户端事务
+   双重确认（覆盖 idle in transaction 与绕过应用的直连写入）。
 5. **收齐才接单**：轮询发布端 `pg_current_wal_lsn()` 与
    `pg_stat_replication.replay_lsn` 一致且 `state=streaming`，再核对两库
    行数与最大编号一致。
@@ -70,13 +77,22 @@ python -I tests/e2e_test.py      # 端到端试跑
 9. **订阅暂停/恢复**：网页按钮执行 `ALTER SUBSCRIPTION DISABLE/ENABLE`。
    暂停期间旧库继续写入可制造复制积压，发起交接即可演示追平超时与自动回滚。
 
-## 已验证结果（tests/e2e_test.py，29/29 通过）
+## 已验证结果（tests/e2e_test.py，60/60 通过）
 
 - 旧库受理工单并自动编号；逻辑复制实时同步到新库；
 - 制造回滚空号与缓存未用号后，实际最大发号 < 序列预留最高号，交接计算的
   首个新编号严格大于该预留最高号；
 - 暂停订阅 → 交接在 8s 超时 → 504 并自动回滚 OLD，旧库恢复接单；
 - 恢复订阅追平后，在途慢事务结束才完成交接；
+- **工单遇上交接**：用表锁让在途写请求停在“已获准、未提交”，交接等到它
+  提交落旧库（编号 < 首个新编号）并复制到新库后才生效；暂停期间提交直接
+  503；生效后工单只写新库，旧库再无新工单；
+- **两次交接重叠（成功路径）**：慢事务拖住交接 A，B 在 A 进行中到达——B 只
+  回报当前接单库（新库），不重复切换；新库序列只对齐一次、交接生效事件只有
+  一条；**（超时路径）**：A 追平超时回滚 OLD，B 同样只回报当前接单库（旧库），
+  耗时约等于 A 而非两倍，回滚只发生一次；
+- **并发压测遇上交接**：4 线程持续提交，响应只有 200/503，旧库受理编号全部
+  小于首个新编号，交接生效后旧库没有迟到工单；
 - 新库序列对齐、新库接单编号接续；重复交接幂等；应用重启后仍为 NEW。
 
 ## 已知边界/剩余事项

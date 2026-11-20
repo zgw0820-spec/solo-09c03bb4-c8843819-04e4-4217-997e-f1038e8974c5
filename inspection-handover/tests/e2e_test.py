@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""端到端试跑：交接成功路径 + 暂停订阅追平超时回滚 + 在途写入 + 重启保持 + 重复点击。
+"""端到端试跑：交接成功路径 + 暂停订阅追平超时回滚 + 在途写入 +
+工单遇上交接（503/在途放行）+ 两次交接重叠 + 并发压测 + 重启保持 + 重复点击。
 
 前置：scripts/local_pg.sh start 已启动两库，应用通过 scripts/local_app.sh 启动。
 用 -I 运行（隔离模式），仅使用标准库 + 虚拟环境内的 psycopg2。
@@ -9,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -72,13 +74,49 @@ def seq_info(dsn: str):
     return rows[0]
 
 
-def reset_state_to_old() -> None:
-    """测试辅助：把演示状态库直接拨回 OLD，便于重复验证交接（不影响 PG 序列）。"""
+def reset_demo_to_old() -> None:
+    """测试辅助：把演示拨回 OLD 以便重复验证交接（生产路径不会回切）。
+
+    交接生效后新库会受理旧库没有的工单（source_db='new'），直接拨回 OLD 会让
+    下一次交接的“两库行数一致”校验失败，旧库序列也可能落到新库已发号段内。
+    因此拨回时一并：删掉新库独有的工单、把旧库序列前推到两库序列已预留的
+    最高号，模拟“从未交接”的干净起点。已复制到两库的工单数据本身不回滚。
+    """
     import sqlite3
     conn = sqlite3.connect(STATE_DB)
     conn.execute("UPDATE kv SET value='OLD' WHERE key='state'")
     conn.commit()
     conn.close()
+    sql(NEW_DSN, "DELETE FROM work_orders WHERE source_db='new'")
+    old_last = seq_info(OLD_DSN)[2] or 0
+    new_last = seq_info(NEW_DSN)[2] or 0
+    sql(OLD_DSN, "SELECT setval('work_orders_id_seq', %s, true)",
+        (max(old_last, new_last),))
+
+
+def spawn_slow_transaction(seconds: int = 3) -> subprocess.Popen:
+    """旧库上的慢写事务：INSERT 后 sleep 再提交，用于制造“在途写入”。"""
+    return subprocess.Popen(
+        [sys.executable, "-c",
+         "import psycopg2,time;"
+         "c=psycopg2.connect('" + OLD_DSN + "');cur=c.cursor();"
+         "cur.execute(\"INSERT INTO work_orders(title,detail,source_db) "
+         "VALUES ('慢事务工单','在途','old')\");"
+         f"time.sleep({seconds});c.commit();c.close()"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cutover_worker(results: dict, tag: str) -> None:
+    """线程内发起一次交接，结果写入 results[tag] = (状态码, 响应体, 耗时)。"""
+    t0 = time.time()
+    code, body = api("POST", "/api/cutover", {"confirm": True}, timeout=60)
+    results[tag] = (code, body, time.time() - t0)
+
+
+def events_since(ts: float, needle: str) -> int:
+    """统计 ts 之后消息中包含 needle 的事件条数。"""
+    _, events = api("GET", "/api/events")
+    return sum(1 for e in events if e["ts"] >= ts and needle in e["message"])
 
 
 def main() -> int:
@@ -155,15 +193,49 @@ def main() -> int:
         time.sleep(0.5)
     check("恢复订阅后新库重新追平", caught, f"old={old_cnt} new={new_cnt}")
 
+    print("== 3b. 两次交接重叠（前者超时回滚）：迟到请求只回报当前接单库 ==")
+    code, body = api("POST", "/api/subscription/pause")
+    check("3b 订阅暂停成功", code == 200 and body["subscriber"]["enabled"] is False)
+    code, body = api("POST", "/api/work-orders", {"title": "3b 积压工单"})
+    check("3b 暂停期间旧库仍可接单", code == 200 and body["accepted_by"] == "old")
+    res3b: dict = {}
+    mark = time.time()
+    ta = threading.Thread(target=cutover_worker, args=(res3b, "A"))
+    ta.start()
+    time.sleep(0.5)  # 让 A 先进入交接（将因订阅暂停而追平超时）
+    tb = threading.Thread(target=cutover_worker, args=(res3b, "B"))
+    tb.start()
+    ta.join(timeout=30)
+    tb.join(timeout=30)
+    code_a, body_a, el_a = res3b["A"]
+    code_b, body_b, el_b = res3b["B"]
+    check("3b 先到的交接超时返回 504 并回滚 OLD",
+          code_a == 504 and body_a["state"] == "OLD", f"{code_a} {body_a}")
+    check("3b 迟到的交接不报错、不重复切换，只回报当前接单库（旧库）",
+          code_b == 200 and body_b.get("duplicate") is True
+          and body_b["accepting_db"] == "old" and body_b["state"] == "OLD",
+          f"{code_b} {body_b}")
+    check("3b 迟到请求只等前者落定，没有自己再跑一次交接（耗时非两倍）",
+          el_b < el_a + 3, f"A={el_a:.1f}s B={el_b:.1f}s")
+    check("3b 回滚只发生一次（迟到请求未再次回滚）",
+          events_since(mark, "交接回滚") == 1, f"{events_since(mark, '交接回滚')} 次")
+    code, body = api("POST", "/api/work-orders", {"title": "3b 回滚后工单"})
+    check("3b 回滚后旧库恢复接单", code == 200 and body["accepted_by"] == "old")
+    code, body = api("POST", "/api/subscription/resume")
+    check("3b 订阅恢复成功", code == 200 and body["subscriber"]["enabled"] is True)
+    deadline = time.time() + 20
+    caught = False
+    while time.time() < deadline:
+        if (sql(OLD_DSN, "SELECT count(*), max(id) FROM work_orders")[0]
+                == sql(NEW_DSN, "SELECT count(*), max(id) FROM work_orders")[0]):
+            caught = True
+            break
+        time.sleep(0.5)
+    check("3b 恢复订阅后新库重新追平", caught)
+
     print("== 5. 在途写入未结束时发起交接：先等写入结束再切换 ==")
     # 5a. 慢事务期间发起交接：状态先进入 SWITCHING 并等待，事务提交后自动完成
-    slow = subprocess.Popen(
-        [sys.executable, "-c",
-         "import psycopg2,time;"
-         "c=psycopg2.connect('"+OLD_DSN+"');cur=c.cursor();"
-         "cur.execute(\"INSERT INTO work_orders(title,detail,source_db) VALUES ('慢事务工单','在途','old')\");"
-         "time.sleep(3);c.commit();c.close()"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    slow = spawn_slow_transaction(3)
     time.sleep(1.0)  # 确保慢事务已开始（idle in transaction）
     t0 = time.time()
     code, body = api("POST", "/api/cutover", {"confirm": True}, timeout=30)
@@ -174,7 +246,157 @@ def main() -> int:
     # 慢事务在 INSERT 后 sleep 3s 才提交；交接在其提交后才继续
     check("交接确实等待了在途写入（>=2.0s）", elapsed >= 2.0, f"{elapsed:.1f}s")
     # 演示需要：把状态回 OLD 以便用干净的序列场景再做一次正式交接验证
-    reset_state_to_old()
+    reset_demo_to_old()
+
+    print("== 5c. 两次交接重叠（前者成功）：迟到请求只回报当前接单库，序列不重复对齐 ==")
+    slow = spawn_slow_transaction(3)
+    time.sleep(1.0)  # 慢事务在途，交接 A 将在 SWITCHING 停留约 2s
+    res5c: dict = {}
+    mark = time.time()
+    ta = threading.Thread(target=cutover_worker, args=(res5c, "A"))
+    ta.start()
+    time.sleep(0.7)  # B 在 A 交接进行中到达（生效前到达、仍待处理）
+    tb = threading.Thread(target=cutover_worker, args=(res5c, "B"))
+    tb.start()
+    ta.join(timeout=30)
+    tb.join(timeout=30)
+    slow.wait(timeout=10)
+    code_a, body_a, el_a = res5c["A"]
+    code_b, body_b, el_b = res5c["B"]
+    check("5c 先到的交接成功", code_a == 200 and body_a.get("switched") is True,
+          f"{code_a} {body_a}")
+    first_5c = body_a["first_new_id"]
+    check("5c 迟到的交接只回报当前接单库（新库），未重复切换",
+          code_b == 200 and body_b.get("duplicate") is True
+          and body_b["accepting_db"] == "new" and "first_new_id" not in body_b,
+          f"{code_b} {body_b}")
+    new_seq_5c = seq_info(NEW_DSN)[2]
+    check("5c 新库序列只对齐一次（等于首个新编号-1，未被迟到请求拨动）",
+          new_seq_5c == first_5c - 1, f"last_value={new_seq_5c} first_new={first_5c}")
+    check("5c 交接生效事件只有一条", events_since(mark, "交接生效") == 1,
+          f"{events_since(mark, '交接生效')} 条")
+    check("5c 序列对齐事件只有一条", events_since(mark, "新库序列已对齐") == 1,
+          f"{events_since(mark, '新库序列已对齐')} 条")
+    old_max_5c = sql(OLD_DSN, "SELECT max(id) FROM work_orders")[0][0]
+    check("5c 旧库没有交接后的迟到工单（最大号 < 首个新编号）",
+          old_max_5c < first_5c, f"old_max={old_max_5c} first_new={first_5c}")
+    code, body = api("POST", "/api/work-orders", {"title": "5c 生效后工单"})
+    check("5c 生效后工单由新库接单且编号接续",
+          code == 200 and body["accepted_by"] == "new"
+          and body["work_order"]["id"] == first_5c, f"{code} {body}")
+    reset_demo_to_old()
+
+    print("== 5d. 工单遇上交接：在途写入放行完毕才切换，暂停期 503，生效后只写新库 ==")
+    # 用 EXCLUSIVE 表锁挡住旧库 INSERT（SELECT 不受影响），让一个在途写请求
+    # 确定性地停在“已获准、未提交”状态
+    lock_conn = psycopg2.connect(OLD_DSN)
+    lock_cur = lock_conn.cursor()
+    lock_cur.execute("LOCK TABLE work_orders IN EXCLUSIVE MODE")
+    res_submit: dict = {}
+
+    def submit_worker(tag: str, title: str) -> None:
+        c, b = api("POST", "/api/work-orders", {"title": title}, timeout=30)
+        res_submit[tag] = (c, b)
+
+    t_slow = threading.Thread(target=submit_worker, args=("slow", "5d 在途工单"))
+    t_slow.start()
+    deadline = time.time() + 10
+    st = {}
+    while time.time() < deadline:
+        _, st = api("GET", "/api/status")
+        if st.get("inflight_writes", 0) >= 1:
+            break
+        time.sleep(0.1)
+    check("5d 暂停前获准的写请求已进入在途计数", st.get("inflight_writes", 0) >= 1, str(st))
+    res5d: dict = {}
+    ta = threading.Thread(target=cutover_worker, args=(res5d, "A"))
+    ta.start()
+    wait_status("SWITCHING", timeout=10)  # 交接已暂停接单，且在等在途写入
+    code, body = api("POST", "/api/work-orders", {"title": "5d 暂停期探针"})
+    check("5d 暂停期间提交工单直接 503", code == 503, f"{code} {body}")
+    time.sleep(0.5)  # 让交接确实等过一段时间
+    lock_conn.rollback()  # 释放在途写入（其事务随即提交）
+    t_slow.join(timeout=15)
+    ta.join(timeout=30)
+    lock_cur.close()
+    lock_conn.close()
+    code_slow, body_slow = res_submit["slow"]
+    code_a, body_a, _ = res5d["A"]
+    first_5d = body_a["first_new_id"]
+    check("5d 暂停前获准的写入完成提交并落入旧库",
+          code_slow == 200 and body_slow["accepted_by"] == "old",
+          f"{code_slow} {body_slow}")
+    check("5d 在途工单编号小于首个新编号（交接等它提交后才对齐序列）",
+          body_slow["work_order"]["id"] < first_5d,
+          f"inflight_id={body_slow['work_order']['id']} first_new={first_5d}")
+    check("5d 交接在在途写入结束后才成功",
+          code_a == 200 and body_a.get("switched") is True, f"{code_a} {body_a}")
+    _, w = api("GET", "/api/work-orders")
+    new_ids = [r["id"] for r in w["new"]]
+    check("5d 在途工单已随复制到达新库", body_slow["work_order"]["id"] in new_ids)
+    code, body = api("POST", "/api/work-orders", {"title": "5d 生效后工单"})
+    check("5d 生效后工单只写新库",
+          code == 200 and body["accepted_by"] == "new"
+          and body["work_order"]["id"] == first_5d, f"{code} {body}")
+    old_max_5d = sql(OLD_DSN, "SELECT max(id) FROM work_orders")[0][0]
+    check("5d 交接生效后旧库没有新工单", old_max_5d < first_5d,
+          f"old_max={old_max_5d} first_new={first_5d}")
+    reset_demo_to_old()
+
+    print("== 5e. 并发提交压测遇上交接：无 500、暂停期 503、无迟到旧库写入 ==")
+    slow = spawn_slow_transaction(3)
+    time.sleep(1.0)
+    stop_hammer = threading.Event()
+    hammer_results: list = []
+
+    def hammer() -> None:
+        i = 0
+        while not stop_hammer.is_set():
+            i += 1
+            try:
+                c, b = api("POST", "/api/work-orders",
+                           {"title": f"5e 压测工单{threading.get_ident()}-{i}"}, timeout=15)
+                hammer_results.append((c, b))
+            except Exception as exc:  # 连接异常也算失败样本
+                hammer_results.append((0, {"error": str(exc)}))
+            time.sleep(0.05)
+
+    hammers = [threading.Thread(target=hammer) for _ in range(4)]
+    for t in hammers:
+        t.start()
+    time.sleep(0.4)  # 先打出一批旧库受理的 200
+    res5e: dict = {}
+    ta = threading.Thread(target=cutover_worker, args=(res5e, "A"))
+    ta.start()
+    ta.join(timeout=30)
+    slow.wait(timeout=10)
+    time.sleep(0.5)  # 让压测线程继续打到 NEW 状态
+    stop_hammer.set()
+    for t in hammers:
+        t.join(timeout=10)
+    code_a, body_a, _ = res5e["A"]
+    first_5e = body_a["first_new_id"]
+    check("5e 压测期间交接成功", code_a == 200 and body_a.get("switched") is True,
+          f"{code_a} {body_a}")
+    codes = {c for c, _ in hammer_results}
+    check("5e 压测响应只有 200/503，没有 500 或异常", codes <= {200, 503}, str(codes))
+    n503 = sum(1 for c, _ in hammer_results if c == 503)
+    check("5e 暂停期间确有提交被 503", n503 >= 1, f"503 数={n503}")
+    old_ids = [b["work_order"]["id"] for c, b in hammer_results
+               if c == 200 and b.get("accepted_by") == "old"]
+    new_ids = [b["work_order"]["id"] for c, b in hammer_results
+               if c == 200 and b.get("accepted_by") == "new"]
+    check("5e 覆盖交接前旧库受理与生效后新库受理两类样本",
+          len(old_ids) >= 1 and len(new_ids) >= 1, f"old={len(old_ids)} new={len(new_ids)}")
+    check("5e 旧库受理编号都小于首个新编号（暂停前获准、交接前已提交）",
+          all(i < first_5e for i in old_ids), f"max(old)={max(old_ids)} first_new={first_5e}")
+    check("5e 新库受理编号都不小于首个新编号",
+          all(i >= first_5e for i in new_ids), f"min(new)={min(new_ids)} first_new={first_5e}")
+    old_max_5e = sql(OLD_DSN, "SELECT max(id) FROM work_orders")[0][0]
+    check("5e 交接生效后旧库没有迟到工单", old_max_5e < first_5e,
+          f"old_max={old_max_5e} first_new={first_5e}")
+    reset_demo_to_old()
+
 
     # 5b. 制造确定的“缓存块内未用号”：短连接取块内首号即断开，
     #     last_value 停在块首，块内其余 cache-1 个号预留但永不使用
